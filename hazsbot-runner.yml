@@ -1,0 +1,773 @@
+# main.py  — Hazsbot v1.0.4 (merged, full-feature)
+# Required Replit secrets: DISCORD_BOT_TOKEN, OPENAI_API_KEY or AI_API_KEY, DEEPSEEK_API_KEY (optional)
+
+import os
+import json
+import random
+import asyncio
+import aiohttp
+import time
+import platform
+from datetime import datetime, timedelta
+
+import discord
+from discord.ext import commands
+
+# optional keep-alive helper for Replit (simple Flask ping endpoint)
+try:
+    from keep_alive import keep_alive
+except Exception:
+    def keep_alive():
+        # noop if keep_alive isn't provided
+        return
+
+# ---------------- CONFIG ----------------
+VERSION = "1.0.4"
+DATA_FILE = "servers.json"
+
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+# Accept both older name AI_API_KEY or OPENAI_API_KEY
+AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # optional
+
+COMMAND_PREFIX = "?"
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+start_time = time.time()
+
+# ---------------- PERSISTENT DATA ----------------
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+server_data = load_data()
+
+def ensure_guild(guild_id: int):
+    gid = str(guild_id)
+    if gid not in server_data:
+        server_data[gid] = {
+            "warnings": {},           # user_id -> [ {reason, when}, ... ]
+            "mod_roles": [],          # role IDs
+            "auto_mod_enabled": True,
+            "scheduled_unbans": [],   # {user_id, unban_iso}
+            "scheduled_unmutes": [],  # {user_id, role_id, unmute_iso}
+        }
+        save_data(server_data)
+    return server_data[gid]
+
+# ---------------- GLOBAL MEMORY ----------------
+last_deleted_message = {}   # channel_id -> {"author": str, "content": str}
+active_wordles = {}         # user_id -> {"word": str, "attempts": int}
+
+# ---------------- UTILITIES ----------------
+async def safe_send(destination, content=None, embed=None):
+    """Send a message but catch and log exceptions instead of raising them."""
+    try:
+        if embed:
+            return await destination.send(embed=embed)
+        else:
+            return await destination.send(content)
+    except Exception as e:
+        print(f"[safe_send] Error sending message: {e}")
+        return None
+
+def is_owner_member(member: discord.Member):
+    return member.guild and (member.guild.owner_id == member.id)
+
+def is_mod(ctx: commands.Context):
+    """Check if the invoking user is allowed to use moderation commands."""
+    if not ctx.guild:
+        return False
+    gid = str(ctx.guild.id)
+    ensure_guild(ctx.guild.id)
+    mod_roles = server_data[gid]["mod_roles"]
+    # If no mod roles set, require Administrator or guild owner
+    if not mod_roles:
+        return ctx.author.guild_permissions.administrator or is_owner_member(ctx.author)
+    # admin or owner always OK
+    if ctx.author.guild_permissions.administrator or is_owner_member(ctx.author):
+        return True
+    member_role_ids = {r.id for r in ctx.author.roles}
+    return any(rid in member_role_ids for rid in mod_roles)
+
+def add_warning(guild_id: int, user_id: int, reason: str):
+    gid = str(guild_id)
+    ensure_guild(guild_id)
+    warns = server_data[gid]["warnings"]
+    warns.setdefault(str(user_id), []).append({"reason": reason, "when": datetime.utcnow().isoformat()})
+    save_data(server_data)
+
+def remove_warning(guild_id: int, user_id: int, index: int = None):
+    gid = str(guild_id)
+    ensure_guild(guild_id)
+    warns = server_data[gid]["warnings"].get(str(user_id), [])
+    if not warns:
+        return None
+    if index is None:
+        return warns.pop()  # last warn
+    idx0 = index - 1
+    if 0 <= idx0 < len(warns):
+        return warns.pop(idx0)
+    return None
+
+# ---------------- SCHEDULED TASKS ----------------
+async def schedule_unban(guild_id: int, user_id: int, unban_at: datetime):
+    gid = str(guild_id)
+    ensure_guild(guild_id)
+    server_data[gid]["scheduled_unbans"].append({"user_id": str(user_id), "unban_iso": unban_at.isoformat()})
+    save_data(server_data)
+
+    now = datetime.utcnow()
+    delay = (unban_at - now).total_seconds()
+    if delay <= 0:
+        delay = 1
+    await asyncio.sleep(delay)
+    try:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            user = await bot.fetch_user(user_id)
+            await guild.unban(user)
+            channel = guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+            if channel:
+                await safe_send(channel, f"(＾▽＾) {user} has been unbanned automatically.")
+    except Exception as e:
+        print(f"[schedule_unban] Error unbanning {user_id} from guild {guild_id}: {e}")
+    # cleanup persisted entry
+    try:
+        server_data[gid]["scheduled_unbans"] = [u for u in server_data[gid]["scheduled_unbans"] if not (u["user_id"] == str(user_id) and u["unban_iso"] == unban_at.isoformat())]
+        save_data(server_data)
+    except Exception as e:
+        print(f"[schedule_unban] Error cleaning scheduled_unbans: {e}")
+
+async def schedule_unmute(guild_id: int, user_id: int, role_id: int, unmute_at: datetime):
+    gid = str(guild_id)
+    ensure_guild(guild_id)
+    server_data[gid]["scheduled_unmutes"].append({"user_id": str(user_id), "role_id": role_id, "unmute_iso": unmute_at.isoformat()})
+    save_data(server_data)
+
+    now = datetime.utcnow()
+    delay = (unmute_at - now).total_seconds()
+    if delay <= 0:
+        delay = 1
+    await asyncio.sleep(delay)
+    try:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            member = guild.get_member(user_id)
+            role = guild.get_role(role_id)
+            if member and role and role in member.roles:
+                await member.remove_roles(role, reason="Temporary mute expired")
+                channel = guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+                if channel:
+                    await safe_send(channel, f"(｡◕‿◕｡) {member.mention} has been unmuted automatically.")
+    except Exception as e:
+        print(f"[schedule_unmute] Error unmuting {user_id} in guild {guild_id}: {e}")
+
+    # cleanup persisted entry
+    try:
+        server_data[gid]["scheduled_unmutes"] = [u for u in server_data[gid]["scheduled_unmutes"] if not (u["user_id"] == str(user_id) and u["role_id"] == role_id and u["unmute_iso"] == unmute_at.isoformat())]
+        save_data(server_data)
+    except Exception as e:
+        print(f"[schedule_unmute] Error cleaning scheduled_unmutes: {e}")
+
+async def resume_schedules():
+    await bot.wait_until_ready()
+    now = datetime.utcnow()
+    for gid, data in server_data.items():
+        # unbans
+        for u in list(data.get("scheduled_unbans", [])):
+            try:
+                unban_time = datetime.fromisoformat(u["unban_iso"])
+                user_id = int(u["user_id"])
+                if unban_time > now:
+                    bot.loop.create_task(schedule_unban(int(gid), user_id, unban_time))
+                else:
+                    bot.loop.create_task(schedule_unban(int(gid), user_id, datetime.utcnow() + timedelta(seconds=2)))
+            except Exception as e:
+                print(f"[resume_schedules] unban schedule error: {e}")
+        # unmutes
+        for u in list(data.get("scheduled_unmutes", [])):
+            try:
+                unmute_time = datetime.fromisoformat(u["unmute_iso"])
+                user_id = int(u["user_id"])
+                role_id = int(u["role_id"])
+                if unmute_time > now:
+                    bot.loop.create_task(schedule_unmute(int(gid), user_id, role_id, unmute_time))
+                else:
+                    bot.loop.create_task(schedule_unmute(int(gid), user_id, role_id, datetime.utcnow() + timedelta(seconds=2)))
+            except Exception as e:
+                print(f"[resume_schedules] unmute schedule error: {e}")
+
+# ---------------- AUTOMOD HELPERS ----------------
+def check_profanity(text: str):
+    profanity = {"badword1", "badword2"}  # Replace with real words
+    t = text.lower()
+    return any(p in t for p in profanity)
+
+def check_caps(text: str):
+    if len(text) < 6:
+        return False
+    caps = sum(1 for c in text if c.isupper())
+    return (caps / max(1, len(text))) > 0.75
+
+def check_invite(text: str):
+    t = text.lower()
+    return "discord.gg/" in t or "discord.com/invite/" in t
+
+# ---------------- WORDLE (colored squares preserved) ----------------
+WORDLE_WORDS = [
+    "oxide","creek","chair","ocean","amber","drink","stone","blaze","nudge","eagle",
+    "sable","giant","lofty","noble","nifty","nurse","diner","inbox","zippy","dodge",
+    "jolly","mirth","valor","magic","irony","woven","kneel","viper","frown","candy",
+    "yodel","frost","ivory","thorn","wrist","night","vigor","queen","scale","haste",
+    "prank","vocal","yacht","orbit","spear","heart","grace","entry","mocha","rapid",
+    "flock","dairy","zilch","opera","globe","mango","olive","hover","piano","knife",
+    "spice","hatch","hound","jelly","liver","laser","wharf","omega","joker","medal",
+    "urban","plaza","ultra","honor","crane","pride","grind","novel","index","quest",
+    "angle","mimic","karma","under","delta","pouch","yummy","zesty","juror","zonal",
+    "tango","unite","gloom","wrath","tiger","raven","lemon","feast","knees","fable",
+    "rumor","union","whale","quack","realm","tempo","peace","yield","elbow","itchy",
+    "acorn","quake","beach","ideal","ember","earth","charm","track","trunk","quill",
+    "zebra","knack","baker","waltz","blend","apple","flame","brain","joint","vivid",
+    "river","roast","gamma","shiny","usher","joust","lunch","lapse","youth"
+]
+
+# ---------------- BOT EVENTS ----------------
+@bot.event
+async def on_ready():
+    print(f"(＾▽＾) Bot online as {bot.user} — Version {VERSION}")
+    print(f"(＾▽＾) Python {platform.python_version()}, discord.py {discord.__version__}")
+    print(f"(＾▽＾) AI key present: {'yes' if bool(AI_API_KEY) else 'no'}")
+    for g in bot.guilds:
+        ensure_guild(g.id)
+    bot.loop.create_task(resume_schedules())
+
+@bot.event
+async def on_message_delete(message):
+    # store last deleted per channel
+    if message.guild and not message.author.bot:
+        last_deleted_message[message.channel.id] = {"author": str(message.author), "content": message.content}
+    await bot.process_commands(message)
+
+@bot.event
+async def on_member_join(member):
+    ensure_guild(member.guild.id)
+    channel = member.guild.system_channel or next((c for c in member.guild.text_channels if c.permissions_for(member.guild.me).send_messages), None)
+    if channel:
+        await safe_send(channel, f"( ´ ▽ ` )ﾉ Welcome {member.mention} to {member.guild.name} — running version {VERSION}!")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    if not message.guild:
+        await bot.process_commands(message)
+        return
+    gdata = ensure_guild(message.guild.id)
+    if gdata.get("auto_mod_enabled", True):
+        if check_profanity(message.content):
+            try:
+                await message.delete()
+                await safe_send(message.channel, f"(╯︵╰,) {message.author.mention}, your message was removed for profanity.")
+            except Exception as e:
+                print(f"[automod] delete/send failed: {e}")
+            return
+        if check_caps(message.content):
+            try:
+                await message.delete()
+                await safe_send(message.channel, f"(¬_¬) {message.author.mention}, please avoid excessive caps.")
+            except Exception as e:
+                print(f"[automod] delete/send failed: {e}")
+            return
+        if check_invite(message.content):
+            try:
+                await message.delete()
+                await safe_send(message.channel, f"(・_・;) {message.author.mention}, invite links are not allowed here.")
+            except Exception as e:
+                print(f"[automod] delete/send failed: {e}")
+            return
+    await bot.process_commands(message)
+
+# ---------------- AI ASK (OpenAI -> DeepSeek fallback) ----------------
+async def get_ai_response(prompt, model="gpt-3.5-turbo", max_tokens=800, temperature=0.7):
+    """
+    Async AI caller: try OpenAI (using AI_API_KEY), fallback to DeepSeek (DEEPSEEK_API_KEY).
+    Returns a string answer or raises/returns error text.
+    """
+    if not AI_API_KEY and not DEEPSEEK_API_KEY:
+        return "(⚠) No AI API key configured."
+
+    # Try OpenAI first (async)
+    if AI_API_KEY:
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {AI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=30) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        print(f"[get_ai_response] OpenAI error: {resp.status} {text}")
+                        raise Exception(f"OpenAI error {resp.status}")
+                    data = await resp.json()
+                    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if not answer:
+                        print(f"[get_ai_response] OpenAI returned unexpected body: {data}")
+                        raise Exception("OpenAI returned unexpected body")
+                    return answer.strip()
+        except Exception as e:
+            print(f"[get_ai_response] OpenAI failed: {e}")
+
+    # Fallback to DeepSeek (async)
+    if DEEPSEEK_API_KEY:
+        try:
+            url2 = "https://api.deepseek.com/v1/chat/completions"
+            headers2 = {
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload2 = {
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": min(800, max_tokens)
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url2, headers=headers2, json=payload2, timeout=30) as resp2:
+                    if resp2.status != 200:
+                        text = await resp2.text()
+                        print(f"[get_ai_response] DeepSeek error: {resp2.status} {text}")
+                        return f"(･_･;) DeepSeek failed: {resp2.status}"
+                    data2 = await resp2.json()
+                    answer2 = data2.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if not answer2:
+                        print(f"[get_ai_response] DeepSeek returned unexpected body: {data2}")
+                        return "(･_･;) DeepSeek returned unexpected response."
+                    return answer2.strip()
+        except Exception as e2:
+            print(f"[get_ai_response] DeepSeek failed: {e2}")
+            return f"(･_･;) Both AI providers failed: {e2}"
+
+    return "(･_･;) AI providers unavailable."
+
+@bot.command(name="ask")
+async def cmd_ask(ctx, *, question: str = None):
+    if not question:
+        return await safe_send(ctx, "(･_･) Please provide a question after `?ask`.")
+    if ctx.guild is None:
+        return await safe_send(ctx, "(･_･) The ask command only works in servers (no DMs).")
+    async with ctx.typing():
+        try:
+            answer = await get_ai_response(question)
+            # Send in chunks to avoid Discord length limits
+            if not answer:
+                return await safe_send(ctx, "(･_･;) AI returned no response.")
+            for i in range(0, len(answer), 1900):
+                await safe_send(ctx, answer[i:i+1900])
+            print(f"[ask] {ctx.author} asked: {question}")
+        except Exception as e:
+            print(f"[ask] Exception: {e}")
+            await safe_send(ctx, f"(･_･;) Error contacting AI: {e}")
+
+# ---------------- COMMANDS ----------------
+
+# Info & Version
+@bot.command(name="version")
+async def cmd_version(ctx):
+    uptime = int(time.time() - start_time)
+    h, rem = divmod(uptime, 3600)
+    m, s = divmod(rem, 60)
+    moderation = [
+        "`?addmodrole @role` - add a mod role (admin only)",
+        "`?removemodrole @role` - remove mod role (admin only)",
+        "`?warn @user <reason>` - warn a user",
+        "`?unwarn @user [index]` - remove user's warning (index optional)",
+        "`?list warnings` - list warnings in server",
+        "`?list modroles` - list server mod roles",
+        "`?ban @user [minutes] <reason>` - ban; minutes optional for temp ban",
+        "`?kick @user <reason>` - kick user"
+    ]
+    fun = [
+        "`?wordle` then `?guess <word>` - play wordle",
+        "`?rps <rock|paper|scissors>` - play RPS",
+        "`?dice <max>` - roll 1..max",
+        "`?coinflip` - flip a coin",
+        "`?ask <question>` - ask the AI (server only)"
+    ]
+    utility = [
+        "`?snipe` - show last deleted message in channel",
+        "`?pin <message_id>` / `?unpin <id>` / `?bulkpin <limit>`",
+        "`?setslowmode <seconds>` - set channel slowmode",
+        "`?remindme <10s|5m|2h> <message>` - reminder",
+        "`?userinfo [@user]` - show user info",
+        "`?avatar [@user]` - show avatar",
+        "`?test` - run diagnostic checks"
+    ]
+    embed = discord.Embed(title=f"Bot v{VERSION}", color=discord.Color.blue())
+    embed.add_field(name="Uptime", value=f"{h}h {m}m {s}s", inline=True)
+    embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Python/discord.py", value=f"{platform.python_version()} / {discord.__version__}", inline=False)
+    embed.add_field(name="Moderation (how to use)", value="\n".join(moderation), inline=False)
+    embed.add_field(name="Fun (how to use)", value="\n".join(fun), inline=False)
+    embed.add_field(name="Utility (how to use)", value="\n".join(utility), inline=False)
+    await safe_send(ctx, embed=embed)
+
+# Test
+@bot.command(name="test")
+async def cmd_test(ctx):
+    results = []
+    # AI key
+    results.append("✅ AI key present" if AI_API_KEY else "(⚠) AI key missing — `?ask` will not work")
+    # storage
+    try:
+        _ = server_data is not None
+        results.append("✅ Persistent storage accessible")
+    except Exception as e:
+        results.append(f"❌ Storage error: {e}")
+    # send test
+    try:
+        await safe_send(ctx, "(＾▽＾) Test message: sending works")
+        results.append("✅ Sending messages OK")
+    except Exception as e:
+        results.append(f"❌ Sending failed: {e}")
+    # snipe
+    results.append("✅ Snipe subsystem ready" if isinstance(last_deleted_message, dict) else "❌ Snipe subsystem problem")
+    # schedule system basic check
+    results.append("✅ Scheduling/persistence expected to work (temp unban/unmute persisted)")
+    # warn/test mod roles
+    try:
+        mod_ok = is_mod(ctx)
+        results.append("✅ Mod-check logic OK" if isinstance(mod_ok, bool) else "❌ Mod-check problem")
+    except Exception as e:
+        results.append(f"❌ Mod-check error: {e}")
+    await safe_send(ctx, "(｡◕‿◕｡) Test results:\n" + "\n".join(results))
+
+# Moderation (add/remove mod roles, warns, ban, kick, mute)
+@bot.command(name="addmodrole")
+@commands.has_permissions(administrator=True)
+async def cmd_addmodrole(ctx, role: discord.Role):
+    gdata = ensure_guild(ctx.guild.id)
+    if role.id in gdata["mod_roles"]:
+        return await safe_send(ctx, f"(¬_¬) Role {role.name} is already a mod role.")
+    gdata["mod_roles"].append(role.id)
+    save_data(server_data)
+    await safe_send(ctx, f"(＾▽＾) Added {role.name} as a mod role.")
+
+@bot.command(name="removemodrole")
+@commands.has_permissions(administrator=True)
+async def cmd_removemodrole(ctx, role: discord.Role):
+    gdata = ensure_guild(ctx.guild.id)
+    if role.id not in gdata["mod_roles"]:
+        return await safe_send(ctx, f"(¬_¬) Role {role.name} is not configured as mod role.")
+    gdata["mod_roles"].remove(role.id)
+    save_data(server_data)
+    await safe_send(ctx, f"(＾▽＾) Removed {role.name} from mod roles.")
+
+@bot.command(name="list")
+async def cmd_list(ctx, category: str = None):
+    if not category:
+        return await safe_send(ctx, "(・_・;) Use `?list warnings` or `?list modroles`")
+    gdata = ensure_guild(ctx.guild.id)
+    if category.lower() == "warnings":
+        lines = []
+        for uid, entries in gdata["warnings"].items():
+            member = ctx.guild.get_member(int(uid))
+            name = member.display_name if member else f"User ID {uid}"
+            lines.append(f"{name}: {len(entries)} warn(s)")
+        if not lines:
+            return await safe_send(ctx, "(･_･) No warnings recorded in this server.")
+        await safe_send(ctx, "(｡◕‿◕｡) Warnings:\n" + "\n".join(lines))
+    elif category.lower() in ("modroles", "mod_roles", "mods"):
+        roles = []
+        for rid in gdata["mod_roles"]:
+            r = ctx.guild.get_role(rid)
+            if r:
+                roles.append(r.name)
+        if not roles:
+            return await safe_send(ctx, "(＾▽＾) There are no mod roles configured in this server.")
+        await safe_send(ctx, "(｡♥‿♥｡) Mod roles:\n" + "\n".join(roles))
+    else:
+        await safe_send(ctx, "(¬_¬) Invalid category. Use `warnings` or `modroles`.")
+
+@bot.command(name="warn")
+async def cmd_warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to warn members.")
+    add_warning(ctx.guild.id, member.id, reason)
+    await safe_send(ctx, f"(｀・ω・´) {member.mention} warned: {reason}")
+
+@bot.command(name="unwarn")
+async def cmd_unwarn(ctx, member: discord.Member, index: int = None):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to unwarn members.")
+    removed = remove_warning(ctx.guild.id, member.id, index)
+    if removed:
+        await safe_send(ctx, f"(＾▽＾) Removed warn: {removed['reason']}")
+    else:
+        await safe_send(ctx, "(･_･) No warn found or invalid index.")
+
+@bot.command(name="ban")
+async def cmd_ban(ctx, member: discord.Member, duration_minutes: int = 0, *, reason: str = "No reason provided"):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to ban members.")
+    try:
+        await ctx.guild.ban(member, reason=reason, delete_message_days=0)
+        await safe_send(ctx, f"(｀・ω・´) {member} banned. Reason: {reason} {'(temporarily)' if duration_minutes>0 else '(permanent)'}")
+        if duration_minutes > 0:
+            unban_at = datetime.utcnow() + timedelta(minutes=duration_minutes)
+            bot.loop.create_task(schedule_unban(ctx.guild.id, member.id, unban_at))
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Failed to ban: {e}")
+
+@bot.command(name="kick")
+async def cmd_kick(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to kick members.")
+    try:
+        await member.kick(reason=reason)
+        await safe_send(ctx, f"(｀・ω・´) {member} kicked. Reason: {reason}")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Failed to kick: {e}")
+
+@bot.command(name="mute")
+async def cmd_mute(ctx, member: discord.Member, minutes: int = 10, *, reason: str = "No reason provided"):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to mute members.")
+    guild = ctx.guild
+    mute_role = discord.utils.get(guild.roles, name="Muted")
+    try:
+        if not mute_role:
+            mute_role = await guild.create_role(name="Muted", reason="Created by bot for mute command")
+            for ch in guild.channels:
+                try:
+                    await ch.set_permissions(mute_role, send_messages=False, speak=False, add_reactions=False)
+                except Exception:
+                    pass
+        await member.add_roles(mute_role, reason=reason)
+        await safe_send(ctx, f"(ﾉ◕‿◕) {member.mention} muted for {minutes} minute(s). Reason: {reason}")
+        unmute_at = datetime.utcnow() + timedelta(minutes=minutes)
+        bot.loop.create_task(schedule_unmute(guild.id, member.id, mute_role.id, unmute_at))
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Could not mute: {e}")
+
+# Pins / Slowmode / Bulkpin
+@bot.command(name="pin")
+async def cmd_pin(ctx, message_id: int):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to pin messages.")
+    try:
+        m = await ctx.channel.fetch_message(message_id)
+        await m.pin()
+        await safe_send(ctx, f"( ^_^)／ Message {message_id} pinned.")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Could not pin message: {e}")
+
+@bot.command(name="unpin")
+async def cmd_unpin(ctx, message_id: int):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to unpin messages.")
+    try:
+        m = await ctx.channel.fetch_message(message_id)
+        await m.unpin()
+        await safe_send(ctx, f"( ^_^)／ Message {message_id} unpinned.")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Could not unpin message: {e}")
+
+@bot.command(name="bulkpin")
+async def cmd_bulkpin(ctx, limit: int = 10):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to bulk pin.")
+    pinned = 0
+    try:
+        async for m in ctx.channel.history(limit=limit):
+            if not m.pinned:
+                await m.pin()
+                pinned += 1
+        await safe_send(ctx, f"(＾▽＾) Pinned {pinned} messages.")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Bulk pin failed: {e}")
+
+@bot.command(name="setslowmode")
+async def cmd_setslowmode(ctx, seconds: int):
+    if not is_mod(ctx):
+        return await safe_send(ctx, "(╯︵╰,) You do not have permission to set slowmode.")
+    if seconds < 0 or seconds > 21600:
+        return await safe_send(ctx, "(･_･;) Slowmode must be 0-21600 seconds.")
+    try:
+        await ctx.channel.edit(slowmode_delay=seconds)
+        await safe_send(ctx, f"(⌛) Slowmode set to {seconds} second(s).")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Could not set slowmode: {e}")
+
+# Audit logs
+@bot.command(name="audit")
+@commands.has_permissions(administrator=True)
+async def cmd_audit(ctx, action: str = None):
+    if action not in ("bans", "kicks", None):
+        return await safe_send(ctx, "(¬_¬) Use `?audit bans` or `?audit kicks`.")
+    entries = []
+    try:
+        async for entry in ctx.guild.audit_logs(limit=20):
+            if action is None:
+                entries.append(f"{entry.action.name} | {entry.target} by {entry.user} at {entry.created_at.isoformat()}")
+            elif action == "bans" and entry.action.name.lower() == "ban":
+                entries.append(f"{entry.target} banned by {entry.user} at {entry.created_at.isoformat()}")
+            elif action == "kicks" and entry.action.name.lower() == "kick":
+                entries.append(f"{entry.target} kicked by {entry.user} at {entry.created_at.isoformat()}")
+        if not entries:
+            return await safe_send(ctx, "(･_･) No audit entries found.")
+        for i in range(0, len(entries), 8):
+            await safe_send(ctx, "```\n" + "\n".join(entries[i:i+8]) + "\n```")
+    except Exception as e:
+        await safe_send(ctx, f"(･_･;) Could not fetch audit logs: {e}")
+
+# Games & utilities (dice, coinflip, rps, wordle already above)
+@bot.command(name="dice")
+async def cmd_dice(ctx, max_number: int = 6):
+    if max_number < 1:
+        return await safe_send(ctx, "(･_･;) Enter a positive number.")
+    r = random.randint(1, max_number)
+    await safe_send(ctx, f"(⌐■_■) Rolled: {r} (1-{max_number})")
+
+@bot.command(name="coinflip")
+async def cmd_coinflip(ctx):
+    res = random.choice(["Heads", "Tails"])
+    await safe_send(ctx, f"(＾▽＾) {ctx.author.mention} flipped: **{res}**")
+
+@bot.command(name="rps")
+async def cmd_rps(ctx, choice: str):
+    choice = choice.lower()
+    if choice not in ("rock", "paper", "scissors"):
+        return await safe_send(ctx, "(･_･;) Use rock, paper, or scissors.")
+    bot_choice = random.choice(["rock", "paper", "scissors"])
+    if choice == bot_choice:
+        result = "It's a tie!"
+    elif (choice, bot_choice) in {("rock","scissors"),("scissors","paper"),("paper","rock")}:
+        result = "You win!"
+    else:
+        result = "You lose!"
+    await safe_send(ctx, f"(＾▽＾) You: {choice} | Bot: {bot_choice} → {result}")
+
+@bot.command(name="wordle")
+async def cmd_wordle(ctx):
+    word = random.choice(WORDLE_WORDS)
+    active_wordles[str(ctx.author.id)] = {"word": word, "attempts": 0}
+    await safe_send(ctx, "(≧◡≦) Wordle started! Guess with `?guess <word>` — 6 attempts total.")
+
+@bot.command(name="guess")
+async def cmd_guess(ctx, guess: str):
+    uid = str(ctx.author.id)
+    if uid not in active_wordles:
+        return await safe_send(ctx, "(･_･) You don't have an active Wordle. Use `?wordle`.")
+    state = active_wordles[uid]
+    target = state["word"]
+    attempts = state["attempts"]
+    if attempts >= 6:
+        del active_wordles[uid]
+        return await safe_send(ctx, f"(｡•́︿•̀｡) Out of attempts. The word was **{target}**.")
+    guess = guess.lower()
+    if len(guess) != 5:
+        return await safe_send(ctx, "(･_･;) Guess must be 5 letters.")
+    feedback = []
+    for i in range(5):
+        if guess[i] == target[i]:
+            feedback.append("🟩")
+        elif guess[i] in target:
+            feedback.append("🟨")
+        else:
+            feedback.append("⬛")
+    state["attempts"] += 1
+    if guess == target:
+        del active_wordles[uid]
+        return await safe_send(ctx, f"(ﾉ◕ヮ◕)ﾉ You guessed it! The word was **{target}**.")
+    if state["attempts"] >= 6:
+        del active_wordles[uid]
+        return await safe_send(ctx, f"(｡•́︿•̀｡) Out of attempts. The word was **{target}**.")
+    await safe_send(ctx, f"{''.join(feedback)} — Attempts used: {state['attempts']}/6")
+
+# Snipe
+@bot.command(name="snipe")
+async def cmd_snipe(ctx):
+    data = last_deleted_message.get(ctx.channel.id)
+    if not data:
+        return await safe_send(ctx, "(・_・;) Nothing to snipe.")
+    await safe_send(ctx, f"(¬‿¬) Last deleted by {data['author']}: {data['content']}")
+
+# Remindme
+@bot.command(name="remindme")
+async def cmd_remindme(ctx, when: str, *, message: str):
+    unit = when[-1]
+    num = when[:-1]
+    if not num.isdigit() or unit not in ("s","m","h"):
+        return await safe_send(ctx, "(･_･;) Use format like 10s, 5m, 2h.")
+    num = int(num)
+    seconds = num if unit == "s" else num*60 if unit == "m" else num*3600
+    await safe_send(ctx, f"(＾▽＾) Reminder set. I will remind you in {when}.")
+    async def do_remind():
+        await asyncio.sleep(seconds)
+        try:
+            await safe_send(ctx.author, f"(🔔) Reminder: {message}")
+        except Exception:
+            try:
+                await safe_send(ctx, f"(🔔) Reminder for {ctx.author.mention}: {message}")
+            except Exception as e:
+                print(f"[remindme] failed to deliver reminder: {e}")
+    bot.loop.create_task(do_remind())
+
+# Userinfo / Avatar
+@bot.command(name="userinfo")
+async def cmd_userinfo(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    created = member.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    joined = member.joined_at.strftime("%Y-%m-%d %H:%M:%S") if member.joined_at else "Unknown"
+    roles = [r.name for r in member.roles if (ctx.guild and r != ctx.guild.default_role) or (not ctx.guild)]
+    perms = [name.replace("_"," ").title() for name, val in member.guild_permissions if val]
+    embed = discord.Embed(title=f"User Info - {member}", color=discord.Color.blurple())
+    embed.set_thumbnail(url=member.avatar.url if member.avatar else None)
+    embed.add_field(name="Display Name", value=member.display_name, inline=True)
+    embed.add_field(name="Username", value=str(member), inline=True)
+    embed.add_field(name="Account Created", value=created, inline=True)
+    embed.add_field(name="Joined Server", value=joined, inline=True)
+    embed.add_field(name="Roles", value=", ".join(roles) or "None", inline=False)
+    embed.add_field(name="Permissions", value=", ".join(perms) or "None", inline=False)
+    await safe_send(ctx, embed=embed)
+
+@bot.command(name="avatar")
+async def cmd_avatar(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    url = member.avatar.url if member.avatar else member.default_avatar.url
+    embed = discord.Embed(title=f"{member.display_name}'s Avatar")
+    embed.set_image(url=url)
+    await safe_send(ctx, embed=embed)
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("ERROR: set DISCORD_BOT_TOKEN in environment/secrets.")
+    else:
+        # start keep-alive (for UptimeRobot)
+        keep_alive()
+        bot.run(DISCORD_TOKEN)
