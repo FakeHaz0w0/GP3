@@ -6,12 +6,12 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 */6 * * *"  # restart every 6 hours to simulate 24/7 uptime
+    - cron: "0 */6 * * *"  # restart every 6 hours
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355  # GitHub limit is 360 min max
+    timeout-minutes: 355
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
